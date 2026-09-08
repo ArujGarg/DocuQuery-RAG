@@ -1,0 +1,47 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+.venv/
+venv/
+ENV/
+env/
+env.bak/
+venv.bak/
+
+# Package & Lock files / Local tool outputs
+.uv/
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Environment variables & secrets
+.env
+.env.local
+.env.*.local
+
+# Vector DBs & Local Storage
+chroma_db/
+*.db
+*.sqlite3
+
+# Byte/Log output
+*.log
+
+# Unit test / coverage reports
+.pytest_cache/
+.coverage
+htmlcov/
+
+# IDE & Editor settings
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS Generated Files
+.DS_Store
+Thumbs.db
