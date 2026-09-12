@@ -13,13 +13,13 @@ from langchain_community.document_loaders import (
     PyPDFLoader,
     TextLoader,
 )
+from langchain_community.embeddings import FastEmbedEmbeddings
 from langchain_community.vectorstores import Chroma
 from langchain_core.chat_history import InMemoryChatMessageHistory
 from langchain_core.output_parsers import StrOutputParser
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langchain_core.runnables.history import RunnableWithMessageHistory
 from langchain_groq import ChatGroq
-from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from pydantic import BaseModel
 
@@ -45,9 +45,7 @@ embeddings = None
 def get_embeddings():
     global embeddings
     if embeddings is None:
-        embeddings = HuggingFaceEmbeddings(
-            model_name="sentence-transformers/all-MiniLM-L6-v2"
-        )
+        embeddings = FastEmbedEmbeddings(model_name="BAAI/bge-small-en-v1.5")
     return embeddings
 
 
