@@ -171,11 +171,13 @@ export default function Home() {
               accept=".pdf,.docx,.doc,.txt,.xlsx,.xls,.csv"
               disabled={uploading}
             />
-            <label htmlFor="fileInput" className="cursor-pointer flex flex-col items-center">
+           <label htmlFor="fileInput" className="cursor-pointer flex flex-col items-center">
               <Upload className="w-10 h-10 text-indigo-400 mb-2" />
               <span className="text-sm font-medium">Click to upload document</span>
-              <span className="text-xs text-gray-500 mt-1">PDF, DOCX, XLSX, TXT, CSV (Max 10MB)</span>
-            </label>
+              <span className="text-xs text-gray-500 mt-1">
+                PDF, DOCX, XLSX, TXT, CSV (Max 10MB / ~25-30 Pages)
+              </span>
+          </label>
           </div>
 
           {uploading && (

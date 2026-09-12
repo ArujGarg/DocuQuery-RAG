@@ -22,6 +22,7 @@ from langchain_core.runnables.history import RunnableWithMessageHistory
 from langchain_groq import ChatGroq
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from pydantic import BaseModel
+from pypdf import PdfReader
 
 # 1. Force single-threaded execution to prevent CPU/RAM thread spikes
 os.environ["OMP_NUM_THREADS"] = "1"
@@ -116,12 +117,18 @@ def health_check():
 MAX_FILE_SIZE = 10 * 1024 * 1024  # 10 MB limit
 
 
+# Maximum total characters allowed (~150k chars is approx 200 chunks or ~25-30 dense pages)
+# This guarantees peak memory stays well under 120 MB on Render's free tier.
+MAX_ALLOWED_CHARS = 150_000
+MAX_FILE_SIZE = 10 * 1024 * 1024  # 10 MB limit
+
+
 @app.post("/upload")
 async def upload_document(
     file: UploadFile = File(...),
     session_id: str | None = Form(None),
 ):
-    # Check File Size
+    # 1. File Size Guard (Prevents streaming massive raw bytes into disk/memory)
     file.file.seek(0, 2)
     file_size = file.file.tell()
     file.file.seek(0)
@@ -140,43 +147,63 @@ async def upload_document(
         tmp_path = tmp_file.name
 
     try:
+        # 2. FAST PRE-FLIGHT CHECK (Instant RAM-safe validation)
+        total_chars = 0
+        if file_ext == ".pdf":
+            reader = PdfReader(tmp_path)
+            for page in reader.pages:
+                text = page.extract_text()
+                if text:
+                    total_chars += len(text)
+                # Fail fast if character count exceeds limit mid-scan
+                if total_chars > MAX_ALLOWED_CHARS:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"Document contains too much text for the free-tier server limit (~{total_chars:,} characters). Please upload a smaller document under ~25–30 pages.",
+                    )
+        elif file_ext == ".txt":
+            with open(tmp_path, "r", encoding="utf-8", errors="ignore") as f:
+                total_chars = len(f.read())
+            if total_chars > MAX_ALLOWED_CHARS:
+                raise HTTPException(
+                    status_code=400,
+                    detail="Text file exceeds the character limit for the free-tier deployment.",
+                )
+
+        # 3. If pre-flight passes, continue with normal parsing and split logic
         documents = load_file_content(tmp_path, file.filename)
 
-        # Chunk documents safely
         text_splitter = RecursiveCharacterTextSplitter(
             chunk_size=700, chunk_overlap=100
         )
         splits = text_splitter.split_documents(documents)
 
-        # Cap max chunks to 300 to protect RAM
-        if len(splits) > 300:
-            splits = splits[:300]
-
-        # Get/Create Disk-backed Vectorstore
+        # 4. Batch Embed directly to disk store
         vectorstore = get_vectorstore_for_session(current_session_id)
 
-        # Batch insert in groups of 32 chunks directly to disk
-        batch_size = 32
+        batch_size = 16
         for i in range(0, len(splits), batch_size):
             batch = splits[i : i + batch_size]
             vectorstore.add_documents(documents=batch)
-
-        # Reclaim Python RAM
-        gc.collect()
+            gc.collect()
 
         return {
             "status": "success",
             "session_id": current_session_id,
             "filename": file.filename,
             "chunks_processed": len(splits),
-            "message": "Document indexed to disk successfully.",
+            "total_characters": total_chars,
+            "message": "Document validated and indexed successfully.",
         }
 
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
     finally:
         if os.path.exists(tmp_path):
             os.remove(tmp_path)
+        gc.collect()
 
 
 @app.post("/chat")
