@@ -1,9 +1,10 @@
 import os
 import shutil
 import tempfile
+import uuid
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 
 # Document Loaders & Splitters
@@ -13,9 +14,10 @@ from langchain_community.document_loaders import (
     TextLoader,
 )
 from langchain_community.vectorstores import Chroma
+from langchain_core.chat_history import InMemoryChatMessageHistory
 from langchain_core.output_parsers import StrOutputParser
-from langchain_core.prompts import ChatPromptTemplate
-from langchain_core.runnables import RunnablePassthrough
+from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
+from langchain_core.runnables.history import RunnableWithMessageHistory
 from langchain_groq import ChatGroq
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_text_splitters import RecursiveCharacterTextSplitter
@@ -38,11 +40,22 @@ app.add_middleware(
 # Initialize free embedding model on CPU
 embeddings = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
 
-# Global reference for Chroma vector store
-vectorstore = None
+# In-Memory Stores
+# vectorstores: { session_id (str): Chroma_instance }
+vectorstores = {}
+# chat_histories: { session_id (str): InMemoryChatMessageHistory_instance }
+chat_histories = {}
+
+
+def get_session_history(session_id: str) -> InMemoryChatMessageHistory:
+    """Retrieves or initializes the chat history for a given session."""
+    if session_id not in chat_histories:
+        chat_histories[session_id] = InMemoryChatMessageHistory()
+    return chat_histories[session_id]
 
 
 class QueryRequest(BaseModel):
+    session_id: str
     question: str
 
 
@@ -89,10 +102,15 @@ def health_check():
 
 
 @app.post("/upload")
-async def upload_document(file: UploadFile = File(...)):
-    """Receives document upload, chunks text, generates embeddings, stores in ChromaDB."""
-    global vectorstore
-
+async def upload_document(
+    file: UploadFile = File(...),
+    session_id: str | None = Form(None),
+):
+    """
+    Receives document upload.
+    If session_id exists, appends vectors to that session's store.
+    If session_id is None, generates a new session_id.
+    """
     allowed_exts = [".pdf", ".docx", ".doc", ".txt", ".xlsx", ".xls", ".csv"]
     file_ext = os.path.splitext(file.filename)[1].lower()
 
@@ -101,6 +119,9 @@ async def upload_document(file: UploadFile = File(...)):
             status_code=400,
             detail=f"Unsupported format. Please upload one of: {', '.join(allowed_exts)}",
         )
+
+    # Use existing session_id or create a new UUID
+    current_session_id = session_id if session_id else str(uuid.uuid4())
 
     with tempfile.NamedTemporaryFile(delete=False, suffix=file_ext) as tmp_file:
         shutil.copyfileobj(file.file, tmp_file)
@@ -115,11 +136,17 @@ async def upload_document(file: UploadFile = File(...)):
         )
         splits = text_splitter.split_documents(documents)
 
-        # Vectorize and index in ChromaDB
-        vectorstore = Chroma.from_documents(documents=splits, embedding=embeddings)
+        # Append to existing vectorstore or initialize a new one for this session
+        if current_session_id in vectorstores:
+            vectorstores[current_session_id].add_documents(documents=splits)
+        else:
+            vectorstores[current_session_id] = Chroma.from_documents(
+                documents=splits, embedding=embeddings
+            )
 
         return {
             "status": "success",
+            "session_id": current_session_id,
             "filename": file.filename,
             "chunks_processed": len(splits),
             "message": "Document indexed successfully.",
@@ -134,13 +161,16 @@ async def upload_document(file: UploadFile = File(...)):
 
 @app.post("/chat")
 async def chat_with_document(request: QueryRequest):
-    """Answers user queries based on context retrieved from the index."""
-    global vectorstore
+    """
+    Answers user queries with conversational history awareness
+    based on the document context retrieved for the session_id.
+    """
+    session_id = request.session_id
 
-    if vectorstore is None:
+    if session_id not in vectorstores:
         raise HTTPException(
             status_code=400,
-            detail="No document uploaded yet. Please upload a document first.",
+            detail="No documents found for this session. Please upload a file first.",
         )
 
     groq_api_key = os.getenv("GROQ_API_KEY")
@@ -149,35 +179,82 @@ async def chat_with_document(request: QueryRequest):
             status_code=500, detail="GROQ_API_KEY environment variable missing."
         )
 
-    def format_docs(docs):
-        return "\n\n".join(doc.page_content for doc in docs)
-
-    retriever = vectorstore.as_retriever(search_kwargs={"k": 3})
-
     llm = ChatGroq(
         groq_api_key=groq_api_key, model_name="openai/gpt-oss-120b", temperature=0
     )
 
-    system_prompt = (
+    retriever = vectorstores[session_id].as_retriever(search_kwargs={"k": 3})
+
+    # Step A: Contextualize Question Chain
+    # Rephrases follow-up questions using past conversation history
+    contextualize_q_system_prompt = (
+        "Given a chat history and the latest user question "
+        "which might reference context in the chat history, "
+        "formulate a standalone question which can be understood "
+        "without the chat history. Do NOT answer the question, "
+        "just reformulate it if needed and otherwise return it as is."
+    )
+    contextualize_q_prompt = ChatPromptTemplate.from_messages(
+        [
+            ("system", contextualize_q_system_prompt),
+            MessagesPlaceholder("chat_history"),
+            ("human", "{input}"),
+        ]
+    )
+    history_aware_retriever = (
+        contextualize_q_prompt | llm | StrOutputParser() | retriever
+    )
+
+    # Step B: Main QA Chain
+    def format_docs(docs):
+        return "\n\n".join(doc.page_content for doc in docs)
+
+    qa_system_prompt = (
         "You are an AI assistant answering questions strictly based on the provided document context. "
         "If the answer is not contained in the context, explicitly state that it is unavailable.\n\n"
         "Context:\n{context}"
     )
-
-    prompt = ChatPromptTemplate.from_messages(
+    qa_prompt = ChatPromptTemplate.from_messages(
         [
-            ("system", system_prompt),
-            ("human", "{question}"),
+            ("system", qa_system_prompt),
+            MessagesPlaceholder("chat_history"),
+            ("human", "{input}"),
         ]
     )
 
+    # FIXED SETUP
     rag_chain = (
-        {"context": retriever | format_docs, "question": RunnablePassthrough()}
-        | prompt
+        {
+            # We use a lambda to map both variables into the history_aware_retriever
+            "context": (
+                (lambda x: {"input": x["input"], "chat_history": x["chat_history"]})
+                | history_aware_retriever
+                | format_docs
+            ),
+            "input": lambda x: x["input"],
+            "chat_history": lambda x: x["chat_history"],
+        }
+        | qa_prompt
         | llm
         | StrOutputParser()
     )
 
-    answer = rag_chain.invoke(request.question)
+    # Step C: Wrap chain with automatic session message persistence
+    conversational_rag_chain = RunnableWithMessageHistory(
+        rag_chain,
+        get_session_history,
+        input_messages_key="input",
+        history_messages_key="chat_history",
+    )
 
-    return {"question": request.question, "answer": answer}
+    # Execute chain for the current session
+    answer = conversational_rag_chain.invoke(
+        {"input": request.question},
+        config={"configurable": {"session_id": session_id}},
+    )
+
+    return {
+        "session_id": session_id,
+        "question": request.question,
+        "answer": answer,
+    }
