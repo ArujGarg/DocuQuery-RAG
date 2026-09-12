@@ -6,14 +6,13 @@ import { Upload, Send, FileText, Loader2, Bot, User, RefreshCw } from 'lucide-re
 import { ChatResponse, Message, UploadResponse } from './types/chat';
 import ReactMarkdown from 'react-markdown';
 
-
 const API_BASE_URL = process.env.NEXT_PUBLIC_API_BASE_URL || 'http://127.0.0.1:8000';
 
 export default function Home() {
   const [sessionId, setSessionId] = useState<string | null>(null);
   const [uploadedFiles, setUploadedFiles] = useState<string[]>([]);
   const [uploading, setUploading] = useState<boolean>(false);
-  
+
   const [messages, setMessages] = useState<Message[]>([]);
   const [inputQuery, setInputQuery] = useState<string>('');
   const [asking, setAsking] = useState<boolean>(false);
@@ -27,16 +26,58 @@ export default function Home() {
     }
   }, [messages, asking]);
 
+  // Cleanup session storage on Render when tab/browser is closed
+  useEffect(() => {
+    const handleUnload = () => {
+      if (sessionId) {
+        const url = `${API_BASE_URL}/session/${sessionId}`;
+        // keepalive guarantees the request executes after tab close
+        fetch(url, { method: 'DELETE', keepalive: true });
+      }
+    };
+
+    window.addEventListener('beforeunload', handleUnload);
+    return () => window.removeEventListener('beforeunload', handleUnload);
+  }, [sessionId]);
+
+  // Unified Session Purge Function
+  const purgeSession = async (id: string | null) => {
+    if (!id) return;
+    try {
+      await fetch(`${API_BASE_URL}/session/${id}`, {
+        method: 'DELETE',
+      });
+    } catch (err) {
+      console.error('Failed to clear session on backend:', err);
+    }
+  };
+
+  // Handle Reset / New Session
+  const handleResetSession = async () => {
+    if (sessionId) {
+      await purgeSession(sessionId);
+    }
+    setSessionId(null);
+    setUploadedFiles([]);
+    setMessages([]);
+  };
+
   // Handle Document Upload (Cumulative Session)
   const handleFileUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const selectedFile = e.target.files?.[0];
     if (!selectedFile) return;
 
+    // 10 MB Client-Side Guard
+    if (selectedFile.size > 10 * 1024 * 1024) {
+      alert('Please upload a file smaller than 10 MB.');
+      e.target.value = '';
+      return;
+    }
+
     setUploading(true);
     const formData = new FormData();
     formData.append('file', selectedFile);
 
-    // Send existing session_id if available to append documents cumulatively
     if (sessionId) {
       formData.append('session_id', sessionId);
     }
@@ -47,7 +88,7 @@ export default function Home() {
       });
 
       const { session_id, filename, chunks_processed } = response.data;
-      
+
       setSessionId(session_id);
       setUploadedFiles((prev) => [...prev, filename]);
 
@@ -55,7 +96,7 @@ export default function Home() {
         ...prev,
         {
           sender: 'bot',
-          text: `Document "${filename}" processed (${chunks_processed} chunks). You can now ask questions across your uploaded context!`,
+          text: `Document **"${filename}"** indexed successfully (${chunks_processed} chunks). You can now ask questions across your uploaded context!`,
         },
       ]);
     } catch (error: any) {
@@ -63,7 +104,7 @@ export default function Home() {
       alert(errorMsg);
     } finally {
       setUploading(false);
-      e.target.value = ''; // Reset input selection
+      e.target.value = '';
     }
   };
 
@@ -75,7 +116,6 @@ export default function Home() {
     const userMessage = inputQuery.trim();
     setInputQuery('');
 
-    // Append user message immediately
     setMessages((prev) => [...prev, { sender: 'user', text: userMessage }]);
     setAsking(true);
 
@@ -98,13 +138,6 @@ export default function Home() {
     } finally {
       setAsking(false);
     }
-  };
-
-  // Reset Session
-  const handleResetSession = () => {
-    setSessionId(null);
-    setUploadedFiles([]);
-    setMessages([]);
   };
 
   return (
@@ -141,7 +174,7 @@ export default function Home() {
             <label htmlFor="fileInput" className="cursor-pointer flex flex-col items-center">
               <Upload className="w-10 h-10 text-indigo-400 mb-2" />
               <span className="text-sm font-medium">Click to upload document</span>
-              <span className="text-xs text-gray-500 mt-1">PDF, DOCX, XLSX, TXT, CSV</span>
+              <span className="text-xs text-gray-500 mt-1">PDF, DOCX, XLSX, TXT, CSV (Max 10MB)</span>
             </label>
           </div>
 
@@ -201,20 +234,20 @@ export default function Home() {
                   </div>
                 )}
                 <div
-  className={`p-4 rounded-xl max-w-xl text-sm leading-relaxed ${
-    msg.sender === 'user'
-      ? 'bg-indigo-600 text-white rounded-br-none'
-      : 'bg-gray-800 text-gray-200 border border-gray-700 rounded-bl-none'
-  }`}
->
-  {msg.sender === 'bot' ? (
-    <div className="prose prose-invert max-w-none text-sm leading-relaxed">
-      <ReactMarkdown>{msg.text}</ReactMarkdown>
-    </div>
-  ) : (
-    msg.text
-  )}
-</div>
+                  className={`p-4 rounded-xl max-w-xl text-sm leading-relaxed ${
+                    msg.sender === 'user'
+                      ? 'bg-indigo-600 text-white rounded-br-none'
+                      : 'bg-gray-800 text-gray-200 border border-gray-700 rounded-bl-none'
+                  }`}
+                >
+                  {msg.sender === 'bot' ? (
+                    <div className="space-y-2 [&_ul]:list-disc [&_ul]:pl-4 [&_ol]:list-decimal [&_ol]:pl-4 [&_li]:mb-1 [&_strong]:font-semibold [&_strong]:text-indigo-300 [&_p]:mb-2 last:[&_p]:mb-0">
+                      <ReactMarkdown>{msg.text}</ReactMarkdown>
+                    </div>
+                  ) : (
+                    msg.text
+                  )}
+                </div>
                 {msg.sender === 'user' && (
                   <div className="p-2 bg-gray-700 rounded-lg flex-shrink-0">
                     <User className="w-5 h-5 text-white" />

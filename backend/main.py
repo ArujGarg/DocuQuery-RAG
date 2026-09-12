@@ -1,13 +1,13 @@
+import gc
 import os
 import shutil
 import tempfile
 import uuid
 
+import chromadb
 from dotenv import load_dotenv
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-
-# Document Loaders & Splitters
 from langchain_community.document_loaders import (
     Docx2txtLoader,
     PyPDFLoader,
@@ -23,12 +23,15 @@ from langchain_groq import ChatGroq
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from pydantic import BaseModel
 
-# Load environment variables from .env
+# 1. Force single-threaded execution to prevent CPU/RAM thread spikes
+os.environ["OMP_NUM_THREADS"] = "1"
+os.environ["MKL_NUM_THREADS"] = "1"
+os.environ["OPENBLAS_NUM_THREADS"] = "1"
+
 load_dotenv()
 
 app = FastAPI(title="Multi-Document RAG API")
 
-# Enable CORS for React/Next.js frontend communication
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -37,8 +40,12 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Initialize free embedding model on CPU
+# 2. Disk-backed Persistent ChromaDB Client
+# Stores vectors on disk (/tmp) so RAM stays near 0 MB when idle
+PERSIST_DIR = "/tmp/chroma_db"
+chroma_client = chromadb.PersistentClient(path=PERSIST_DIR)
 
+# Lightweight FastEmbed (ONNX engine: uses ~40MB RAM vs 400MB PyTorch)
 embeddings = None
 
 
@@ -49,15 +56,11 @@ def get_embeddings():
     return embeddings
 
 
-# In-Memory Stores
-# vectorstores: { session_id (str): Chroma_instance }
-vectorstores = {}
-# chat_histories: { session_id (str): InMemoryChatMessageHistory_instance }
+# Chat history stays in RAM (takes almost 0 MB)
 chat_histories = {}
 
 
 def get_session_history(session_id: str) -> InMemoryChatMessageHistory:
-    """Retrieves or initializes the chat history for a given session."""
     if session_id not in chat_histories:
         chat_histories[session_id] = InMemoryChatMessageHistory()
     return chat_histories[session_id]
@@ -69,9 +72,7 @@ class QueryRequest(BaseModel):
 
 
 def load_file_content(file_path: str, filename: str):
-    """Parses text dynamically based on document file extension."""
     ext = os.path.splitext(filename)[1].lower()
-
     if ext == ".pdf":
         loader = PyPDFLoader(file_path)
         return loader.load()
@@ -84,29 +85,31 @@ def load_file_content(file_path: str, filename: str):
     elif ext in [".xlsx", ".xls", ".csv"]:
         import pandas as pd
 
-        if ext == ".csv":
-            df = pd.read_csv(file_path)
-        else:
-            df = pd.read_excel(file_path)
-
+        df = pd.read_csv(file_path) if ext == ".csv" else pd.read_excel(file_path)
         text_data = df.to_string()
         with tempfile.NamedTemporaryFile(
             delete=False, suffix=".txt", mode="w", encoding="utf-8"
         ) as tmp:
             tmp.write(text_data)
-            tmp_txt_path = tmp.name
-
-        loader = TextLoader(tmp_txt_path)
-        docs = loader.load()
-        os.remove(tmp_txt_path)
+            tmp_path = tmp.name
+        docs = TextLoader(tmp_path).load()
+        os.remove(tmp_path)
         return docs
     else:
         raise ValueError(f"Unsupported file extension: {ext}")
 
 
+def get_vectorstore_for_session(session_id: str) -> Chroma:
+    """Connects to disk storage for the specified session_id."""
+    return Chroma(
+        client=chroma_client,
+        collection_name=f"session_{session_id}",
+        embedding_function=get_embeddings(),
+    )
+
+
 @app.get("/health")
 def health_check():
-    """Keep-alive ping endpoint for cron jobs."""
     return {"status": "ok", "message": "Server active"}
 
 
@@ -118,22 +121,7 @@ async def upload_document(
     file: UploadFile = File(...),
     session_id: str | None = Form(None),
 ):
-    """Receives document upload.
-
-    If session_id exists, appends vectors to that session's store. If
-    session_id is None, generates a new session_id. Enforces size limits,
-    chunk caps, and batch vectorization for Render memory stability.
-    """
-    allowed_exts = [".pdf", ".docx", ".doc", ".txt", ".xlsx", ".xls", ".csv"]
-    file_ext = os.path.splitext(file.filename)[1].lower()
-
-    if file_ext not in allowed_exts:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Unsupported format. Please upload one of: {', '.join(allowed_exts)}",
-        )
-
-    # 1. File Size Guard (Prevents processing large files into RAM)
+    # Check File Size
     file.file.seek(0, 2)
     file_size = file.file.tell()
     file.file.seek(0)
@@ -141,11 +129,11 @@ async def upload_document(
     if file_size > MAX_FILE_SIZE:
         raise HTTPException(
             status_code=400,
-            detail="File size exceeds the 10 MB limit for free tier deployment.",
+            detail="File size exceeds the 10 MB limit.",
         )
 
-    # Use existing session_id or create a new UUID
-    current_session_id = session_id if session_id else str(uuid.uuid4())
+    current_session_id = session_id or str(uuid.uuid4())
+    file_ext = os.path.splitext(file.filename)[1].lower()
 
     with tempfile.NamedTemporaryFile(delete=False, suffix=file_ext) as tmp_file:
         shutil.copyfileobj(file.file, tmp_file)
@@ -154,49 +142,34 @@ async def upload_document(
     try:
         documents = load_file_content(tmp_path, file.filename)
 
-        # 2. Text Chunking
+        # Chunk documents safely
         text_splitter = RecursiveCharacterTextSplitter(
             chunk_size=700, chunk_overlap=100
         )
         splits = text_splitter.split_documents(documents)
 
-        # 3. Safety Guard: Hard cap maximum chunks to protect 512 MB RAM limit
+        # Cap max chunks to 300 to protect RAM
         if len(splits) > 300:
             splits = splits[:300]
 
-        # 4. Batch Vector Embedding (32 chunks per batch)
-        embedding_function = get_embeddings()
+        # Get/Create Disk-backed Vectorstore
+        vectorstore = get_vectorstore_for_session(current_session_id)
 
-        if current_session_id in vectorstores:
-            vectorstore = vectorstores[current_session_id]
-        else:
-            # Initialize vectorstore using the first batch to avoid empty initialization errors
-            first_batch = splits[:32]
-            vectorstore = Chroma.from_documents(
-                documents=first_batch,
-                embedding=embedding_function,
-                collection_name=f"session_{current_session_id}",
-            )
-            vectorstores[current_session_id] = vectorstore
-            splits = splits[32:]  # Exclude first batch since it's already indexed
-
-        # Process remaining splits in mini-batches of 32
+        # Batch insert in groups of 32 chunks directly to disk
         batch_size = 32
         for i in range(0, len(splits), batch_size):
             batch = splits[i : i + batch_size]
             vectorstore.add_documents(documents=batch)
 
+        # Reclaim Python RAM
+        gc.collect()
+
         return {
             "status": "success",
             "session_id": current_session_id,
             "filename": file.filename,
-            "chunks_processed": (
-                len(splits) + 32
-                if current_session_id in vectorstores
-                and len(splits) < len(text_splitter.split_documents(documents))
-                else len(splits)
-            ),
-            "message": "Document indexed successfully in memory-safe batches.",
+            "chunks_processed": len(splits),
+            "message": "Document indexed to disk successfully.",
         }
 
     except Exception as e:
@@ -208,13 +181,16 @@ async def upload_document(
 
 @app.post("/chat")
 async def chat_with_document(request: QueryRequest):
-    """
-    Answers user queries with conversational history awareness
-    based on the document context retrieved for the session_id.
-    """
     session_id = request.session_id
 
-    if session_id not in vectorstores:
+    # Verify if collection exists on disk
+    try:
+        collection = chroma_client.get_collection(name=f"session_{session_id}")
+        if collection.count() == 0:
+            raise HTTPException(
+                status_code=400, detail="No indexed documents in this session."
+            )
+    except Exception:
         raise HTTPException(
             status_code=400,
             detail="No documents found for this session. Please upload a file first.",
@@ -230,10 +206,10 @@ async def chat_with_document(request: QueryRequest):
         groq_api_key=groq_api_key, model_name="openai/gpt-oss-120b", temperature=0
     )
 
-    retriever = vectorstores[session_id].as_retriever(search_kwargs={"k": 3})
+    # Retrieve from disk-backed collection
+    vectorstore = get_vectorstore_for_session(session_id)
+    retriever = vectorstore.as_retriever(search_kwargs={"k": 3})
 
-    # Step A: Contextualize Question Chain
-    # Rephrases follow-up questions using past conversation history
     contextualize_q_system_prompt = (
         "Given a chat history and the latest user question "
         "which might reference context in the chat history, "
@@ -252,7 +228,6 @@ async def chat_with_document(request: QueryRequest):
         contextualize_q_prompt | llm | StrOutputParser() | retriever
     )
 
-    # Step B: Main QA Chain
     def format_docs(docs):
         return "\n\n".join(doc.page_content for doc in docs)
 
@@ -269,10 +244,8 @@ async def chat_with_document(request: QueryRequest):
         ]
     )
 
-    # FIXED SETUP
     rag_chain = (
         {
-            # We use a lambda to map both variables into the history_aware_retriever
             "context": (
                 (lambda x: {"input": x["input"], "chat_history": x["chat_history"]})
                 | history_aware_retriever
@@ -286,7 +259,6 @@ async def chat_with_document(request: QueryRequest):
         | StrOutputParser()
     )
 
-    # Step C: Wrap chain with automatic session message persistence
     conversational_rag_chain = RunnableWithMessageHistory(
         rag_chain,
         get_session_history,
@@ -294,14 +266,37 @@ async def chat_with_document(request: QueryRequest):
         history_messages_key="chat_history",
     )
 
-    # Execute chain for the current session
     answer = conversational_rag_chain.invoke(
         {"input": request.question},
         config={"configurable": {"session_id": session_id}},
     )
 
+    gc.collect()
+
     return {
         "session_id": session_id,
         "question": request.question,
         "answer": answer,
+    }
+
+
+@app.delete("/session/{session_id}")
+async def clear_session(session_id: str):
+    """Deletes a session's ChromaDB collection from disk and clears in-memory chat history."""
+    try:
+        # 1. Delete collection from ChromaDB disk persistent storage
+        chroma_client.delete_collection(name=f"session_{session_id}")
+    except Exception:
+        # Collection might already be deleted or didn't exist
+        pass
+
+    # 2. Remove chat history from memory dictionary
+    chat_histories.pop(session_id, None)
+
+    # 3. Trigger Python garbage collection
+    gc.collect()
+
+    return {
+        "status": "success",
+        "message": f"Session {session_id} storage and history cleared.",
     }
