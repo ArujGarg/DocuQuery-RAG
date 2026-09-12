@@ -112,15 +112,19 @@ def health_check():
     return {"status": "ok", "message": "Server active"}
 
 
+MAX_FILE_SIZE = 10 * 1024 * 1024  # 10 MB limit
+
+
 @app.post("/upload")
 async def upload_document(
     file: UploadFile = File(...),
     session_id: str | None = Form(None),
 ):
-    """
-    Receives document upload.
-    If session_id exists, appends vectors to that session's store.
-    If session_id is None, generates a new session_id.
+    """Receives document upload.
+
+    If session_id exists, appends vectors to that session's store. If
+    session_id is None, generates a new session_id. Enforces size limits,
+    chunk caps, and batch vectorization for Render memory stability.
     """
     allowed_exts = [".pdf", ".docx", ".doc", ".txt", ".xlsx", ".xls", ".csv"]
     file_ext = os.path.splitext(file.filename)[1].lower()
@@ -129,6 +133,17 @@ async def upload_document(
         raise HTTPException(
             status_code=400,
             detail=f"Unsupported format. Please upload one of: {', '.join(allowed_exts)}",
+        )
+
+    # 1. File Size Guard (Prevents processing large files into RAM)
+    file.file.seek(0, 2)
+    file_size = file.file.tell()
+    file.file.seek(0)
+
+    if file_size > MAX_FILE_SIZE:
+        raise HTTPException(
+            status_code=400,
+            detail="File size exceeds the 10 MB limit for free tier deployment.",
         )
 
     # Use existing session_id or create a new UUID
@@ -141,26 +156,49 @@ async def upload_document(
     try:
         documents = load_file_content(tmp_path, file.filename)
 
-        # Chunk text (700 chars, 100 char overlap)
+        # 2. Text Chunking
         text_splitter = RecursiveCharacterTextSplitter(
             chunk_size=700, chunk_overlap=100
         )
         splits = text_splitter.split_documents(documents)
 
-        # Append to existing vectorstore or initialize a new one for this session
+        # 3. Safety Guard: Hard cap maximum chunks to protect 512 MB RAM limit
+        if len(splits) > 300:
+            splits = splits[:300]
+
+        # 4. Batch Vector Embedding (32 chunks per batch)
+        embedding_function = get_embeddings()
+
         if current_session_id in vectorstores:
-            vectorstores[current_session_id].add_documents(documents=splits)
+            vectorstore = vectorstores[current_session_id]
         else:
-            vectorstores[current_session_id] = Chroma.from_documents(
-                documents=splits, embedding=get_embeddings()
+            # Initialize vectorstore using the first batch to avoid empty initialization errors
+            first_batch = splits[:32]
+            vectorstore = Chroma.from_documents(
+                documents=first_batch,
+                embedding=embedding_function,
+                collection_name=f"session_{current_session_id}",
             )
+            vectorstores[current_session_id] = vectorstore
+            splits = splits[32:]  # Exclude first batch since it's already indexed
+
+        # Process remaining splits in mini-batches of 32
+        batch_size = 32
+        for i in range(0, len(splits), batch_size):
+            batch = splits[i : i + batch_size]
+            vectorstore.add_documents(documents=batch)
 
         return {
             "status": "success",
             "session_id": current_session_id,
             "filename": file.filename,
-            "chunks_processed": len(splits),
-            "message": "Document indexed successfully.",
+            "chunks_processed": (
+                len(splits) + 32
+                if current_session_id in vectorstores
+                and len(splits) < len(text_splitter.split_documents(documents))
+                else len(splits)
+            ),
+            "message": "Document indexed successfully in memory-safe batches.",
         }
 
     except Exception as e:
