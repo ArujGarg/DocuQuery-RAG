@@ -181,7 +181,7 @@ async def upload_document(
         # 4. Batch Embed directly to disk store
         vectorstore = get_vectorstore_for_session(current_session_id)
 
-        batch_size = 16
+        batch_size = 64
         for i in range(0, len(splits), batch_size):
             batch = splits[i : i + batch_size]
             vectorstore.add_documents(documents=batch)
