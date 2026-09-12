@@ -38,7 +38,18 @@ app.add_middleware(
 )
 
 # Initialize free embedding model on CPU
-embeddings = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
+
+embeddings = None
+
+
+def get_embeddings():
+    global embeddings
+    if embeddings is None:
+        embeddings = HuggingFaceEmbeddings(
+            model_name="sentence-transformers/all-MiniLM-L6-v2"
+        )
+    return embeddings
+
 
 # In-Memory Stores
 # vectorstores: { session_id (str): Chroma_instance }
@@ -141,7 +152,7 @@ async def upload_document(
             vectorstores[current_session_id].add_documents(documents=splits)
         else:
             vectorstores[current_session_id] = Chroma.from_documents(
-                documents=splits, embedding=embeddings
+                documents=splits, embedding=get_embeddings()
             )
 
         return {
